@@ -1,0 +1,214 @@
+---
+title: "2_Predict_USA_BGC_Hexgrid"
+format: html
+editor: visual
+author: "William H MacKenzie & Kiri Daust"
+date: "20/04/2024"
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+require(reshape2)
+require(parallel)
+require(foreach)
+require(doParallel)
+require(ggplot2)
+require(ranger)
+require (tools)
+require(data.table)
+require(spatstat)
+require(spatialEco)
+require(survey)
+require(scales)
+require(tidyverse)
+require(rlang)
+require(Rcpp)
+require(forcats)
+require(purrrlyr)
+require(tictoc)
+require(tidymodels)
+require(spatialsample)
+require(themis)
+require(sf)
+# require(conflicted)
+require(ggtext)
+require(tidypredict)
+tidymodels_prefer()
+#install.packages ("spThin")
+conflicted::conflict_prefer(name = "spec", winner = "yardstick")
+
+source("./_functions/AddVars.R")
+```
+
+### Load saved USA_BGC model
+
+```{r Load model}
+load("./rfmodels/USAv13_26Feb2025_tidymodel.Rdata")
+model_vars <- BGCmodel$fit$fit$fit
+model_vars <- model_vars$variable.importance
+model_vars <- as.data.frame(model_vars)  %>% tibble::rownames_to_column()# %>% filter(!rowname == "ID")
+###for  xgboost
+#model_vars <- extract_fit_parsnip(BGCmodel)# %>% vip(num_features = 400)
+#model_vars <- model_vars$fit$feature_names
+
+```
+
+### Predict BGC of state hex grids
+
+This predicts each point in a state hexgrid (data saved from 0_climr_attribution). The scripts then dissolve the hexgrid to reduce size and remove (decrumb) small BGC polygons to further simplify.
+
+Save each state BGC as a .gpkg file. This takes about 1.5 hours to run through 9 western states.
+
+```{r function to predict BGC of each state}
+#load("./outputs/USAv12_62nosmote_VAR_SubZone_ranger.Rdata")
+# bring in grid data with climate attributes
+
+predict_state_hex <- function(region){
+# Z1 <- fread(paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990MSY.csv"), stringsAsFactors = FALSE,  data.table = FALSE) %>% 
+#   addVars() %>% 
+#   filter_all(all_vars(. > -9999)) %>% 
+#   dplyr::rename(ID = id)
+Z1 <- readRDS(paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990SY.rds")) %>% 
+  filter_all(all_vars(. > -9999))
+
+
+grid.info <- Z1 %>% dplyr::select(id, lat, lon, elev)
+grid.dat <-  Z1 %>%  select(id, model_vars$rowname)
+grid.dat$id <- as.integer(grid.dat$id)
+###Predict
+grid.pred <- predict(BGCmodel, grid.dat) #%>% mutate(BGC.pred = as.character(.pred_class))
+#grid.pred <- grid.pred %>% mutate(BGC.pred = as.character(.pred_class))
+grid.info <- grid.info %>% filter(grid.info$id %in% grid.dat$id)
+grid.pred <- cbind(grid.info, grid.pred) %>% dplyr::rename(BGC.pred = .pred_class)
+grid.pred$BGC <-
+  fct_na_value_to_level(as.factor(grid.pred$BGC.pred) , level = "(None)")
+grid.pred <- grid.pred %>%  dplyr::select(id, BGC)#"Longitude","Latitude", "Elevation", "Zone")]
+grid.pred$id <- as.character(grid.pred$id)
+fwrite(grid.pred, paste0("./outputs/grid_preds/", region,"_predicted_hexpts.csv"))
+
+### joint to hexpoly grid
+hexpoly <- st_read(dsn = paste0("./inputs/hex_shapes/", region, "_bgc_hex400.gpkg"))#, layer = "USA_bgc_hex_800m")
+hexpoly$hex_id <- as.character(hexpoly$hex_id)
+hexZone <- left_join(hexpoly, grid.pred, by = c("hex_id" = "id"))# %>% st_transform(3005) %>% st_cast()
+temp <- hexZone %>% select(BGC, geom)
+temp2 <- st_zm(temp, drop=T, what='ZM') 
+
+###Dissolve 
+temp3 <- hexZone
+temp3$BGC <- droplevels(temp3$BGC)
+temp3 <-  st_as_sf(temp3)# 
+st_precision(temp3) <- .5 
+temp3$BGC <- 
+  fct_na_value_to_level(as.factor(temp3$BGC), level = "(None)")#forcats::fct_explicit_na(temp3$BGC,na_level = "(None)")
+
+temp3 <- temp3[,c("BGC","geom")]#,"Elevation"
+t2 <- aggregate(temp3[,-1], by = list(temp3$BGC), do_union = T, FUN = mean) %>% rename(BGC = Group.1)
+wna_boundary = st_read("./inputs/spatial_files/WNA_State_Boundaries.gpkg") %>% 
+  st_as_sf() %>% filter(State %in% region) %>%
+  st_transform( crs = st_crs(3005)) %>%
+  st_buffer(., dist = 0)
+
+t2 <- st_zm(t2, drop=T, what='ZM') %>% 
+  st_transform(crs = st_crs(3005))  %>% 
+  st_buffer(0)
+t2 <- st_intersection(t2, wna_boundary)
+
+# st_write(t2, dsn = paste0("./outputs/", region, "_SubZoneMap_hex400_dissolved_19Apr2024.gpkg"), driver = "GPKG", delete_dsn = TRUE)
+
+t2a <- st_cast(t2, "MULTIPOLYGON") %>% st_cast("POLYGON")
+t2a <- t2a %>%
+  mutate(Area = st_area(.)) %>%
+  mutate(id = seq_along(BGC))
+
+### decrumb polygons
+require (units)
+size <- 600000
+size <- set_units(size, "m^2")
+tSmall <- t2a[t2a$Area <= size,]
+t2a$BGC <- as.character(t2a$BGC)
+
+require(doParallel)
+coreNum <- as.numeric(detectCores()-1)
+coreNo <- makeCluster(coreNum)
+registerDoParallel(coreNo, cores = coreNum)
+
+###loop through each polygon < size, determine intersects, and assign to BGC with most edge touching
+###all the built in functions Kiri found only dealt with holes in the middle of polygons
+
+new <- foreach(i = 1:length(tSmall$id), .combine = rbind, .packages = c("foreach","sf")) %dopar% {
+  id <- tSmall$id[i]
+  nbrs <- st_intersects(tSmall[i,],t2a)[[1]]
+  nbrs <- nbrs[!nbrs %in% id]
+  if(length(nbrs) == 0){return(NULL)}
+  lines <- st_intersection(t2a[id,],t2a[nbrs,])
+  lines <- st_cast(lines)
+  l.len <- st_length(lines)
+  names(l.len) <- lines$BGC.1
+  zn <- names(l.len)[l.len == max(l.len)][1]
+  newDat <- t2a[id,]
+  newDat$BGC <- zn
+  newDat
+}
+
+stopCluster(coreNo)
+gc()
+
+temp <- t2a[!t2a$id %in% new$id,]
+t2a <- rbind(temp, new) %>%
+  mutate(BGC = as.factor(BGC))
+# ###now have to combine crumbs with existing large polygons
+temp2 <- t2a
+temp2 <- st_make_valid(temp2)
+st_precision(temp2) <- 2
+t3 <- temp2 %>%  st_buffer(dist = 0) %>% #filter(!id == "2741") %>% 
+  group_by(BGC) %>%
+  summarise(geom = sf::st_union(geometry)) %>%
+  ungroup()
+
+t3 <- st_zm(t3, drop=T, what='ZM')
+st_write(t3, dsn = paste0("./state_BGCmaps/", region, "_BGC_26Feb2025_decrumbed.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+gc()
+}
+
+```
+
+```{r run predict function}
+tic()
+predict_state_hex(region = "WA")
+predict_state_hex(region = "OR")
+predict_state_hex(region = "CA")
+predict_state_hex(region = "ID")
+predict_state_hex(region = "MT")
+predict_state_hex(region = "WY")
+predict_state_hex(region = "CO")
+predict_state_hex(region = "UT")
+predict_state_hex(region = "NV")
+toc()## takes about  1550s for WA
+```
+
+```{r smooth}
+# ## smooth polygon boundaries
+# tic()
+# #t3_smooth <- smoothr::smooth(t3, method = "densify")
+# t3_smooth <- smoothr::smooth(t3, method = "ksmooth", smoothness = 2)#)
+# #t3_smooth.spline <- smoothr::smooth(t3_smooth, method = "spline")
+# # holes = .5
+# # area_thresh <- units::set_units(holes, km^2)
+# # p_dropped <- smoothr::fill_holes(t3_smooth, threshold = area_thresh)
+# # t3_smooth <- p_dropped
+# #st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_19May2021_smoothed_densify-smooth.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+# st_write(t3_smooth, dsn = paste0("./outputs/", region, "_BGC_5Apr2022_smoothed.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+# toc()
+```
+
+```{r simplify vector map}
+# require(terra)
+# require(rmapshaper)
+# require(tictoc)
+# BGC_map <- read_sf("D:/CommonTables/BGC_maps/WNA_BGC_v12_5Apr2022_new.gpkg")
+# tic()
+# BGC_map2 <-  rmapshaper::ms_simplify(BGC_map, keep = 0.005, method = 'vis', weighting = 0.7, explode = FALSE, sys = TRUE)
+# toc()
+# BGC_map2 <-  rmapshaper::ms_dissolve(BGC_map2, field = "BGC", sys = TRUE)
+# st_write(BGC_map2, "D:/CommonTables/BGC_maps/WNA_BGC_v12_5Apr2022_new_simplified_dissolved_v1.gpkg", append = FALSE)
+```

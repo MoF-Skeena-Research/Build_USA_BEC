@@ -43,13 +43,18 @@ Points from a 4km hex grid of western north america are generated in R and submi
 
 ```{r download for training points}
 
-coords <- fread("./inputs/training_pts/US_TrainingPoints_07Dec2023.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% dplyr::filter(!BGC == "NA") %>% dplyr::rename(long = LON, lat = LAT, elev = ELEV_m, id = ID1) %>% dplyr::select(long,lat,elev, id, BGC) %>% dplyr::filter(!is.na(lat))
-setcolorder(coords, c("long","lat","elev", "id", "BGC"))
+coords <- fread("D:/OneDrive/WNA_BGC/TrainingPoints/US_TrainingPoints_15April2024.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% dplyr::filter(!BGC == "NA") %>% dplyr::rename(lon = LON, lat = LAT, elev = ELEV_m, id = ID1) %>% dplyr::select(lon,lat,elev, id, BGC) %>% dplyr::filter(!is.na(lat))
+setcolorder(coords, c("lon","lat","elev", "id", "BGC"))
 
 rad_exclusion = 1000 ##  minimum meters between points
 #require(Spbsampling)
+coords2 <- fread("./inputs/training_pts/BGCv13_Border_TrainingPoints_26Feb2025.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% 
+  group_by(BGC) %>%
+  slice_sample(n=200)
 
+setcolorder(coords2, c("lon","lat","elev", "id", "BGC"))
 
+coords <- rbind(coords, coords2)
 # require(spsurvey)
 # coords <- coords[!is.na("elev"),]
 # coords_sf <- st_as_sf(coords, coords = c("long","lat"), crs = 4326)
@@ -72,42 +77,39 @@ rad_exclusion = 1000 ##  minimum meters between points
 # setcolorder(coords, c("long","lat","elev","id"))
 # coords.bgc <- coords %>% dplyr::select(id, BGC) %>% dplyr::rename(ID = id)
 ## based on vs_final below
-
+#climr::cache_clear()
 
 tic()
-clim_vars <- climr_downscale(coords, which_normal = "Colin", vars = c(climr::list_variables(),"CMI"), return_normal = TRUE, cache = TRUE)
+clim_vars <- climr::downscale(xyz=coords, obs_periods = NULL, vars = list_vars(set = c("Annual", "Seasonal")), cache = TRUE)
 toc()
 setDT(clim_vars)
 clim_vars[,PERIOD := NULL]
 #clim_vars[,ID := NULL]
-clim_vars <- clim_vars %>% dplyr::select(ID, BGC,everything())# %>% dplyr::select(-contains(remove))
-saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_9Jan2023_colin.rds")
-# library(caret)
-#   correlationMatrix <- cor(clim_vars2[,!"BGC"])
-#   highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.7, verbose = TRUE, names = TRUE) ## review for removal of highly correlated vars
-#    highlyCorrelated
-
+clim_vars <- clim_vars %>% left_join(coords) %>% dplyr::select(id, BGC,everything()) %>% na.omit  %>% dplyr::select(-DDsub0_sm)
+saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_26Feb2025.rds")
+library(caret)
+clim_vars2 <- clim_vars %>% select(-BGC, -id, -lon, -lat, -elev) %>% as.data.frame %>% na.omit
+  correlationMatrix <- cor(clim_vars2)
+  highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.9, verbose = TRUE, names = TRUE) ## review for removal of highly correlated vars
+clim_vars <- clim_vars %>% select(-highlyCorrelated)
+saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_26Feb2025_reduced.rds")
 ```
 
 ```{r download for map grid}
-region = "WA"
-coords <- fread(paste0("./inputs/grids/", region, "_400m_HexPts.csv"), stringsAsFactors = FALSE,  data.table = FALSE) %>% dplyr::rename(long = Longitude, lat = Latitude, elev = Elevation, id = ID1) %>% dplyr::select(long,lat,elev, id) %>% dplyr::filter(!is.na(lat)) %>% distinct(id, .keep_all = TRUE) %>% as.data.frame
-setcolorder(coords, c("long","lat","elev", "id"))
-# fwrite(coords, paste0("./inputs/grids/", region, "_400m_HexPts_new.csv"))
-# coords <- fread(paste0("./inputs/grids/", region, "_400m_HexPts_new.csv"), stringsAsFactors = FALSE,  data.table = FALSE)
-#coords <- coords[30000:31000,]
+states = c("CA", "CO", "ID", "MT", "NV", "OR", "UT","WA", "WY")
+for (region in states) {
+coords <- fread(paste0("./inputs/grids/", region, "_400m_HexPts.csv"), stringsAsFactors = FALSE,  data.table = FALSE) %>% dplyr::rename(lon = Longitude, lat = Latitude, elev = Elevation, id = ID1) %>% dplyr::select(lon,lat,elev, id) %>% dplyr::filter(!is.na(lat)) %>% distinct(id, .keep_all = TRUE) %>% as.data.frame
+setcolorder(coords, c("lon","lat","elev", "id"))
 tic()
-clim_vars <- climr_downscale(coords, which_normal = "Colin", vars = c(climr::list_variables(), "CMI"), return_normal = TRUE, cache = TRUE)
+clim_vars <- climr::downscale(xyz=coords, obs_periods = NULL, vars = list_vars(set = c("Annual", "Seasonal")), cache = TRUE)
 toc()
 setDT(clim_vars)
 clim_vars[,PERIOD := NULL]
 #clim_vars[,ID := NULL]
-clim_vars <- clim_vars %>% dplyr::select(ID, everything())
-#fwrite(clim_vars, paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990MSY_Colin.csv"))
-fwrite(clim_vars, paste0("E:/", region, "_400m_HexPts_Normal_1961_1990MSY_Colin.csv"))
-
-# %>% dplyr::select(-contains(remove))
-#saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_3Jan2023.rds")
+clim_vars <- clim_vars %>% left_join(coords) %>% dplyr::select(id, everything())
+#clim_vars <- clim_vars %>% dplyr::select(id, everything())
+saveRDS(clim_vars, paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990SY.rds"))
+}
 ```
 
 
