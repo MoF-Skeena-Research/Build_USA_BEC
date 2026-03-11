@@ -1,7 +1,7 @@
 ---
 title: "Random Forest Model of Biogeoclimatic Units for Western North America"
 author: "William H MacKenzie & Kiri Daust"
-date: "22/03/2020"
+date: today
 output:
   word_document: default
   html_document: default
@@ -43,14 +43,14 @@ Points from a 4km hex grid of western north america are generated in R and submi
 
 ```{r download for training points}
 
-coords <- fread("D:/OneDrive/WNA_BGC/TrainingPoints/US_TrainingPoints_15April2024.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% dplyr::filter(!BGC == "NA") %>% dplyr::rename(lon = LON, lat = LAT, elev = ELEV_m, id = ID1) %>% dplyr::select(lon,lat,elev, id, BGC) %>% dplyr::filter(!is.na(lat))
+coords <- fread("D:/OneDrive/WNA_BGC/TrainingPoints/US_TrainingPoints_05March2026.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% dplyr::filter(!BGC == "NA") %>% dplyr::rename(lon = LON, lat = LAT, elev = ELEV_m, id = ID1) %>% dplyr::select(lon,lat,elev, id, BGC) %>% dplyr::filter(!is.na(lat))
 setcolorder(coords, c("lon","lat","elev", "id", "BGC"))
 
 rad_exclusion = 1000 ##  minimum meters between points
 #require(Spbsampling)
 coords2 <- fread("./inputs/training_pts/BGCv13_Border_TrainingPoints_26Feb2025.csv",  stringsAsFactors = FALSE,data.table = FALSE) %>% 
   group_by(BGC) %>%
-  slice_sample(n=200)
+  slice_sample(n=100) %>% ungroup
 
 setcolorder(coords2, c("lon","lat","elev", "id", "BGC"))
 
@@ -86,13 +86,13 @@ setDT(clim_vars)
 clim_vars[,PERIOD := NULL]
 #clim_vars[,ID := NULL]
 clim_vars <- clim_vars %>% left_join(coords) %>% dplyr::select(id, BGC,everything()) %>% na.omit  %>% dplyr::select(-DDsub0_sm)
-saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_26Feb2025.rds")
+saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_6Mar2026.rds")
 library(caret)
 clim_vars2 <- clim_vars %>% select(-BGC, -id, -lon, -lat, -elev) %>% as.data.frame %>% na.omit
   correlationMatrix <- cor(clim_vars2)
   highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.9, verbose = TRUE, names = TRUE) ## review for removal of highly correlated vars
 clim_vars <- clim_vars %>% select(-highlyCorrelated)
-saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_26Feb2025_reduced.rds")
+saveRDS(clim_vars, "./inputs/training_pts/USA_training_data_6Mar2026_reduced.rds")
 ```
 
 ```{r download for map grid}
@@ -101,14 +101,23 @@ for (region in states) {
 coords <- fread(paste0("./inputs/grids/", region, "_400m_HexPts.csv"), stringsAsFactors = FALSE,  data.table = FALSE) %>% dplyr::rename(lon = Longitude, lat = Latitude, elev = Elevation, id = ID1) %>% dplyr::select(lon,lat,elev, id) %>% dplyr::filter(!is.na(lat)) %>% distinct(id, .keep_all = TRUE) %>% as.data.frame
 setcolorder(coords, c("lon","lat","elev", "id"))
 tic()
-clim_vars <- climr::downscale(xyz=coords, obs_periods = NULL, vars = list_vars(set = c("Annual", "Seasonal")), cache = TRUE)
+clim_vars <- climr::downscale(xyz=coords, obs_periods = NULL, 
+                              vars = list_vars(set = c("Annual", "Seasonal")), 
+                              cache = TRUE,
+                               db_option = "local")
 toc()
+tic()
 setDT(clim_vars)
 clim_vars[,PERIOD := NULL]
 #clim_vars[,ID := NULL]
 clim_vars <- clim_vars %>% left_join(coords) %>% dplyr::select(id, everything())
-#clim_vars <- clim_vars %>% dplyr::select(id, everything())
+#setDT(clim_vars)
+#setDT(coords)
+#clim_vars2 <- coords[clim_vars, on = "id"][, .(id, .SD)]
+
+clim_vars <- clim_vars %>% dplyr::select(id, everything())
 saveRDS(clim_vars, paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990SY.rds"))
+toc()
 }
 ```
 
