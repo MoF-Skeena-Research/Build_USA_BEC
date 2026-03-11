@@ -3,7 +3,7 @@ title: "2_Predict_USA_BGC_Hexgrid"
 format: html
 editor: visual
 author: "William H MacKenzie & Kiri Daust"
-date: "20/04/2024"
+date: today
 ---
 
 ```{r setup, include=FALSE, echo=FALSE}
@@ -30,6 +30,7 @@ require(tidymodels)
 require(spatialsample)
 require(themis)
 require(sf)
+require(units)
 # require(conflicted)
 require(ggtext)
 require(tidypredict)
@@ -43,7 +44,7 @@ source("./_functions/AddVars.R")
 ### Load saved USA_BGC model
 
 ```{r Load model}
-load("./rfmodels/USAv13_26Feb2025_tidymodel.Rdata")
+load("./rfmodels/USAv13_9Mar2026_tidymodel.Rdata")
 model_vars <- BGCmodel$fit$fit$fit
 model_vars <- model_vars$variable.importance
 model_vars <- as.data.frame(model_vars)  %>% tibble::rownames_to_column()# %>% filter(!rowname == "ID")
@@ -59,7 +60,7 @@ This predicts each point in a state hexgrid (data saved from 0_climr_attribution
 
 Save each state BGC as a .gpkg file. This takes about 1.5 hours to run through 9 western states.
 
-```{r function to predict BGC of each state}
+```{r original function to predict BGC of each state}
 #load("./outputs/USAv12_62nosmote_VAR_SubZone_ranger.Rdata")
 # bring in grid data with climate attributes
 
@@ -103,7 +104,7 @@ temp3$BGC <-
 
 temp3 <- temp3[,c("BGC","geom")]#,"Elevation"
 t2 <- aggregate(temp3[,-1], by = list(temp3$BGC), do_union = T, FUN = mean) %>% rename(BGC = Group.1)
-wna_boundary = st_read("./inputs/spatial_files/WNA_State_Boundaries.gpkg") %>% 
+wna_boundary = st_read("./inputs/spatial_files/WNA_StateProv_Boundaries.gpkg") %>% 
   st_as_sf() %>% filter(State %in% region) %>%
   st_transform( crs = st_crs(3005)) %>%
   st_buffer(., dist = 0)
@@ -166,19 +167,236 @@ t3 <- temp2 %>%  st_buffer(dist = 0) %>% #filter(!id == "2741") %>%
   ungroup()
 
 t3 <- st_zm(t3, drop=T, what='ZM')
-st_write(t3, dsn = paste0("./state_BGCmaps/", region, "_BGC_26Feb2025_decrumbed.gpkg"), driver = "GPKG",delete_dsn = TRUE)
+st_write(t3, dsn = paste0("./state_BGCmaps/", region, "_BGC_9Mar2026_decrumbed_new.gpkg"), driver = "GPKG",delete_dsn = TRUE)
 gc()
 }
 
 ```
 
+## This one works pretty good but the output has geometry problems that need to be solved in script
+```{r fixed terra version}
+#region  = "MT"
+predict_state_hex <- function(region){
+
+  library(sf)
+  library(dplyr)
+  library(forcats)
+  library(data.table)
+  library(doParallel)
+  library(tictoc)
+  library(terra)
+
+  message("Loading grid…")
+  Z1 <- readRDS(paste0("./inputs/grids/", region, "_400m_HexPts_Normal_1961_1990SY.rds")) %>%
+    filter_all(all_vars(. > -9999))
+
+  grid.info <- Z1 %>% select(id, lat, lon, elev)
+  grid.dat  <- Z1 %>% select(id, model_vars$rowname)
+  grid.dat$id <- as.integer(grid.dat$id)
+
+  message("Predicting BGC classes…")
+  tic()
+  grid.pred <- predict(BGCmodel, grid.dat)
+  grid.pred <- cbind(grid.info, grid.pred) %>%
+    rename(BGC.pred = .pred_class)
+
+  grid.pred$BGC <- fct_na_value_to_level(as.factor(grid.pred$BGC.pred), "(None)")
+  grid.pred <- grid.pred %>% select(id, BGC)
+  grid.pred$id <- as.character(grid.pred$id)
+
+  fwrite(grid.pred, paste0("./outputs/grid_preds/", region,"_predicted_hexpts.csv"))
+  toc()
+
+  message("Joining predictions to hex grid…")
+  tic()
+  hexpoly <- st_read(paste0("./inputs/hex_shapes/", region, "_bgc_hex400.gpkg"))
+  hexpoly$hex_id <- as.character(hexpoly$hex_id)
+
+  hexZone <- left_join(hexpoly, grid.pred, by = c("hex_id" = "id"))
+  hexZone <- st_make_valid(hexZone)
+    hexZone <- st_zm(hexZone, drop = TRUE)
+st_precision(hexZone) <- .5
+  hexZone$BGC <- fct_na_value_to_level(as.factor(hexZone$BGC), "(None)")
+  toc()
+
+  # --- HEX-LEVEL DECRUMBING ---------------------------------------------
+
+  message("Computing connected components (hex-level)…")
+  tic()
+# hex_clean <- st_make_valid(hexZone)
+#  hex_clean <- st_zm(hex_clean, drop = TRUE)
+library(sf)
+library(igraph)
+library(dplyr)
+# compute adjacency (touching hexes) 
+  hex_cc <- hexZone %>% group_by(BGC) %>% group_modify(~{
+  
+  nb <- st_touches(.x)
+  g  <- graph_from_adj_list(nb)
+  
+  .x$patch <- components(g)$membership
+  .x
+})
+#### Raster based approach works for all by Montana)
+# v <- vect(hex_clean)
+# v$BGC_int <- as.integer(as.factor(v$BGC))
+# 
+# # Build a raster template from hex centroids
+# cent <- st_centroid(hexZone)
+# cent_v <- vect(cent)
+# 
+# # Create raster with one cell per hex
+# r <- rast(cent_v, resolution = 100)   # 400 m hex spacing
+# crs(r) <- crs(v)
+# 
+# 
+#   # rasterize BGC classes
+#   r_bgc <- rasterize(v, r, field = "BGC_int")
+#   #r_bgc[is.na(r_bgc)] <- 0
+# 
+#   # connected components (patches) on raster
+#   r_cc <- terra::patches(r_bgc, directions = 8)
+# plot(r_cc)
+  # extract patch IDs back to hex polygons
+  # patch_vals <- terra::extract(r_cc, v, fun = "first")
+
+  # 
+  # patch_vals_unique <- patch_vals |>
+  # dplyr::group_by(ID) |>
+  # dplyr::summarise(patch = dplyr::first(patches))
+
+  #  patch_vals <- patch_vals  %>% distinct
+  hex_sf <- st_as_sf(hex_cc)
+  hex_sf <- st_make_valid(hex_sf)
+st_precision(hex_sf) <- 2
+  #hex_sf$patch <- patch_vals$patch
+  toc()
+
+  message("Identifying crumbs (< 10 hexes per patch)…")
+  tic()
+  patch_sizes <- hex_sf %>%
+    st_drop_geometry() %>%
+    count(BGC, patch, name = "n_hex")
+
+  hex_sf <- hex_sf %>%
+    left_join(patch_sizes, by = c("BGC", "patch"))
+
+  crumbs <- hex_sf %>% filter(n_hex < 10)
+  cores  <- hex_sf %>% filter(n_hex >= 10)
+  toc()
+
+  message("Precomputing neighbors for crumbs…")
+  tic()
+  crumbs <- st_make_valid(crumbs)
+  cores  <- st_make_valid(cores)
+  crumbs <- st_zm(crumbs, drop = TRUE)
+  cores  <- st_zm(cores, drop = TRUE)
+
+  nbr_list <- st_touches(crumbs, cores)
+
+  crumbs_bound <- st_boundary(crumbs)
+  cores_bound  <- st_boundary(cores)
+  toc()
+
+  message("Reassigning crumbs to neighboring BGCs…")
+  tic()
+  coreNum <- max(1, parallel::detectCores() - 1)
+  cl <- makeCluster(coreNum)
+  registerDoParallel(cl)
+
+  reassigned <- foreach(i = seq_len(nrow(crumbs)), .combine = rbind,
+                        .packages = c("sf", "dplyr")) %dopar% {
+
+    nbr_idx <- nbr_list[[i]]
+    if (length(nbr_idx) == 0) return(NULL)
+
+    shared <- tryCatch(
+      suppressWarnings(st_intersection(crumbs_bound[i], cores_bound[nbr_idx, ])),
+      error = function(e) NULL
+    )
+    if (is.null(shared) || length(shared) == 0) return(NULL)
+
+    l.len <- st_length(shared)
+    names(l.len) <- cores$BGC[nbr_idx]
+
+    new_bgc <- names(l.len)[which.max(l.len)]
+    out <- crumbs[i, ]
+    out$BGC <- new_bgc
+    out
+  }
+
+  stopCluster(cl)
+  gc()
+  toc()
+
+  message("Rebuilding hex grid after decrumbing…")
+  tic()
+  if (!is.null(reassigned) && nrow(reassigned) > 0) {
+    reassigned_ids <- reassigned$hex_id
+    hex_final <- bind_rows(
+      cores,
+      reassigned,
+      crumbs %>% filter(!hex_id %in% reassigned_ids)
+    )
+  } else {
+    hex_final <- hex_sf
+    st_precision(hex_final) <- 2
+  }
+  hex_final$BGC <- as.factor(hex_final$BGC)
+  toc()
+  
+  st_crs(hex_final) <- st_crs(3005)
+  hex_final <- st_transform(hex_final, 5070)
+  out_path <- paste0("./state_BGCmaps/", region, "_BGC_10Mar2026_5070.gpkg")
+st_write(hex_final, out_path, delete_dsn = TRUE)
+  # --- FINAL DISSOLVE + OPTIONAL CLIP -----------------------------------
+
+  message("Final dissolve by BGC (terra)…")
+  tic()
+  v_final <- vect(hex_final[, c("BGC", "geom")])
+  v_diss  <- aggregate(v_final, "BGC")
+  t3      <- st_as_sf(v_diss)
+  t3      <- st_zm(t3, drop = TRUE)
+  st_precision(t3) <- 2 
+   st_crs(t3) <- st_crs(5070)
+  #t3 <- st_transform(t3, 5070)
+  toc()
+
+  message("Clipping dissolved map to state boundary (terra)…")
+  tic()
+  wna_boundary <- st_read("./inputs/spatial_files/WNA_StateProv_Boundaries.gpkg") %>%
+    filter(State %in% region) %>%
+    st_transform(5070) %>%
+    st_buffer(0)
+
+  vb  <- vect(wna_boundary)
+  v3  <- vect(t3)
+
+  v3  <- crop(v3, vb)
+  v3  <- mask(v3, vb)
+
+  t3  <- st_as_sf(v3)
+  t3  <- st_zm(t3, drop = TRUE)
+  st_crs(t3) <- st_crs(5070)
+  toc()
+
+  out_path <- paste0("./state_BGCmaps/", region, "_BGC_9Mar2026_decrumbed_5070.gpkg")
+  st_write(t3, out_path, delete_dsn = TRUE)
+
+  message("Done.")
+  invisible(t3)
+}
+```
+
+
 ```{r run predict function}
 tic()
 predict_state_hex(region = "WA")
-predict_state_hex(region = "OR")
-predict_state_hex(region = "CA")
 predict_state_hex(region = "ID")
+
+predict_state_hex(region = "OR")
 predict_state_hex(region = "MT")
+predict_state_hex(region = "CA")
 predict_state_hex(region = "WY")
 predict_state_hex(region = "CO")
 predict_state_hex(region = "UT")
